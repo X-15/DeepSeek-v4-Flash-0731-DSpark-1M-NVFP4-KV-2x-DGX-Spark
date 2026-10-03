@@ -1,22 +1,178 @@
-# DeepSeek V4 Flash (DSpark) on 2x DGX Spark — 1M context, NVFP4 KV
+# DeepSeek-V4-Flash-Vision-Exp (DSpark) on DGX Spark — TP2 (2 nodes) or TP4 (4 nodes), 1M context, NVFP4 KV
+
+> **2026-09-10: DeepSeek-V4.1-Flash is out.** The four-Spark vLLM TP4 recipe for it (Engram-on-disk patch, sm121 kernel build, launchers, measured numbers) lives in its own repo: **[tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-vLLM-DGX-Spark)**. This repo stays the DeepSeek-V4-Flash-Vision-Exp (DS4) recipe.
+
+**Current recipe: see [`CURRENT.md`](CURRENT.md).** That file, not this page, is the source of truth.
+
+**Launchers:** [`launchers/ds4-vision-tp2.sh <0|1>`](launchers/ds4-vision-tp2.sh) — ranks 1 (bluey) then 0 (asusi, head) · [`launchers/ds4-vision-tp4.sh <0|1|2|3>`](launchers/ds4-vision-tp4.sh) — ranks 3, 2, 1, then 0 (asusi, head). Both serve `:8888` as **`deepseek-v4-flash-dspark`**.
+
+**Preflight — Patch 4 fails silently, so check it before trusting any number:** `./scripts/check-patch4.sh <head-container> <worker-container>`
+
+Everything else on this page is reference; `archive/` (coming) is history.
+
+## 🆕 2026-08-31 — now running **DeepSeek-V4-Flash-Vision-Exp**, with native vision
+
+DeepSeek released
+[**DeepSeek-V4-Flash-Vision-Exp**](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp)
+today — the first multimodal model in the V4 family. **It is deployed here the same day,
+on 2x DGX Spark at TP2, with real image input and DSpark speculative decoding intact.**
+
+```
+"Based on the image, the two colors are red and blue.
+ Red is on the left side. Blue is on the right side."
+```
+
+Not a sidecar and not a VLM proxy — the model's own 32-block ViT and aligner running
+inside vLLM. This needed a genuine port: vLLM's `DeepseekV4ForCausalLM` is the **text-only**
+class, and the vision checkpoint reports the *same* architecture string while carrying 316
+tensors vLLM has nowhere to put, so it fails to load at all. DeepSeek shipped only a
+reference implementation, explicitly "rather than a production serving engine."
+
+| | measured, 2x GB10, TP2, temperature 0 |
+|---|---|
+| **KV cache pool** | **2,904,519 tokens** (18.18 GiB) |
+| **Context** | **1,500,000** per request · max concurrency **1.94x** |
+| Vision, 336x336 + 26-token answer | **1.03 s** end to end |
+| Image understanding | colour **and** position correct, both orientations |
+
+Measured on the profile as it stood that day — `MAX_MODEL_LEN=1500000`, `MAX_NUM_SEQS=12`,
+`GPU_MEMORY_UTILIZATION=0.85`, `MTP_NUM_TOKENS=3` — with the vision port on top. **The current
+validated profile is `MAX_MODEL_LEN=1048576` (1M) and `MTP_NUM_TOKENS=5`; the KV/context figures
+in the table above were taken at 1.5M and are not current — see [`CURRENT.md`](CURRENT.md).**
+**Use `k=5`, same as the 0731 recipe, with Patch 4 mounted.** An earlier version of this branch said k=3: that A/B was measured without the Patch 4 `spec-dspark.py` mount, which silently halves the draft's acceptance (see `vision-exp/README.md`, [#48](../../issues/48)). With Patch 4 present, k=5 wins count-to-300 by a third and code is neutral. This release moved `num_nextn_predict_layers` from 1 to 3, which is why the drafter deserves a second look, but not at k=3.
+
+**→ [Full guide, the twelve blockers, and the port: `vision-exp/`](vision-exp/README.md)**
+
+Two deviations from the reference are documented there and are **not** yet fixed —
+bidirectional attention inside image spans, and the new `bias_vl` modality-specific MoE
+routing bias. Both affect image quality, neither affects text. Read that section before
+quoting this against benchmarks.
+
+Text-only `0731` is unchanged and still fully supported — every patch is guarded on
+`vision_n_layers`, so the same files serve both checkpoints.
+
+---
 
 > Self-contained two-node DGX Spark recipe for serving DeepSeek-V4-Flash with vLLM
 > TP=2, DSpark speculative decoding, and an experimental `nvfp4_ds_mla` KV cache —
-> 1M-token calibrated context (pushed to 1.5M), clean under agent concurrency.
+> 1M-token calibrated context, clean under agent concurrency.
 >
-> **Covers both checkpoints:**
+> **Current default: `DeepSeek-V4-Flash-Vision-Exp`** — the experimental **vision** variant
+> (native image input) served on our 2× DGX Spark cluster. It reuses this repo's entire text
+> recipe (TP=2, `nvfp4_ds_mla` KV, 1M context, DSpark `k=5`, Patch 3, Patch 4) and adds the
+> vision-model files as read-only bind-mounts. **Start here →
+> [Serving DeepSeek-V4-Flash-Vision-Exp](#serving-deepseek-v4-flash-vision-exp--current-default-2026-08-31)**
+> and the full byte-for-byte command in
+> [`VISION-EXP-DEFAULT-CONFIG.md`](VISION-EXP-DEFAULT-CONFIG.md).
+>
+> **Also covers the text checkpoints** (the tuning/troubleshooting base the vision recipe inherits):
 > - **`deepseek-ai/DeepSeek-V4-Flash-0731`** (official release) — **78 tok/s peak, ~55 typical.**
 >   Requires [Patch 4](patches/0004-dspark-shared-expert-gate-up-proj.patch); without it you get
->   roughly half speed at unchanged output quality. **Start here →
->   [Updating to the official 0731 release](#updating-to-the-official-deepseek-v4-flash-0731-release-2026-07-31)**
+>   roughly half speed at unchanged output quality. See
+>   [Updating to the official 0731 release](#updating-to-the-official-deepseek-v4-flash-0731-release-2026-07-31).
 > - **`fraserprice/DeepSeek-V4-Flash-DSpark`** (preview) — 84.3 tok/s peak. Everything in this
 >   README below the 0731 section was measured on this checkpoint and still stands.
->
-> **Censored or uncensored — your choice, same recipe.** The stock DeepSeek weights are the
-> default. If you want the refusal-free build, Keys (drowzeys) publishes an abliterated 0731
-> that drops straight in: same image, same patches, same flags, same context. Only `--model`
-> changes. Access to it is gated and carries a Responsible Use Agreement.
-> **→ [Model choice: censored or uncensored](#model-choice-censored-or-uncensored)**
+
+---
+
+## Serving DeepSeek-V4-Flash-Vision-Exp — current default (2026-08-31)
+
+This is what we run today: the experimental **vision** build of DeepSeek-V4-Flash (native image
+input) on **2× DGX Spark** — head **asusi** (rank0) + worker **bluey** (rank1), TP=2, served on
+`:8888`. It is the same recipe as the text model below, pointed at the vision checkpoint and with
+the vision-model files added as read-only bind-mounts. **[Patch 4](#the-fix-that-must-not-be-dropped-on-the-vision-port)
+is mandatory** — the vision port silently dropped it once and cost us roughly half our decode speed.
+
+- **Model:** `DeepSeek-V4-Flash-Vision-Exp` (checkpoint pinned at commit
+  `86f746b36186f0e567729a5c06a8c918caba82a9`).
+- **Runtime image:** `vllm-dspark-runtime:mia-raf-pr1-nvfp4-probe-c-keys-concurrency-p2b`
+  (vLLM `0.21.1rc1.dev339+g1967a5627bc3`, B12X MXFP4 MoE). This is the same probe-c image family the
+  text recipe was captured on, so it predates the baked-in patches and needs them bind-mounted.
+- **Serving config (verified live):** `--tensor-parallel-size 2`, `--kv-cache-dtype nvfp4_ds_mla`,
+  `--block-size 256`, `--max-model-len 1048576`, `--gpu-memory-utilization 0.85`,
+  `--max-num-seqs 12`, DSpark spec-decode `num_speculative_tokens: 5`. KV pool measured
+  **2,790,000 tokens / 19.12 GiB** at `gpu_memory_utilization=0.85`.
+
+### Mounts (this is the whole point)
+
+The vision port runs the same launcher/compose as the text recipe, pointed at the Vision-Exp
+weights, with these read-only bind-mounts. Stage each source file on **both** nodes at `/var/tmp/`
+first (`start-*.sh` does not copy bind-mounted files to the worker):
+
+```bash
+# Patch 3 — cold-start garble root fix (source: recipe/overlay/vllm/v1/core/sched/scheduler.py)
+-v /var/tmp/patch3-scheduler.py:/opt/env/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py:ro \
+# Patch 4 — DSpark draft shared-expert loader fix (source: recipe/overlay/vllm/v1/spec_decode/dspark.py)
+#   *** REQUIRED. Without this mount the draft's always-on shared expert loads uninitialised
+#   *** and decode runs at ~half speed, failing SILENTLY (the drop is a logger.debug line).
+-v /var/tmp/spec-dspark.py:/opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py:ro \
+# Vision-model files (native image support): ds4v_model.py / ds4v_vision.py / ds4v_mm.py / ds4v_registry.py
+#   staged the same way onto the image's DeepSeek-V4 model + registry module paths.
+-v /var/tmp/ds4v_model.py:.../ds4v_model.py:ro \
+-v /var/tmp/ds4v_vision.py:.../ds4v_vision.py:ro \
+-v /var/tmp/ds4v_mm.py:.../ds4v_mm.py:ro \
+-v /var/tmp/ds4v_registry.py:.../ds4v_registry.py:ro \
+```
+
+Full byte-for-byte command, env, and node table: **[`VISION-EXP-DEFAULT-CONFIG.md`](VISION-EXP-DEFAULT-CONFIG.md)**.
+
+### The fix that must not be dropped on the vision port
+
+When we stood the vision serving port up, its run command carried the Patch 3 and vision mounts but
+**silently dropped the Patch 4 `spec-dspark.py` mount**. The stock loader then took over: the DSpark
+draft's shared expert (`shared_experts.gate_up_proj`) loaded **uninitialised** (12 tensors dropped),
+draft acceptance collapsed, and decode ran at **roughly half speed** — with perfect output quality,
+which is exactly what sends you looking in the wrong place. It fails **silently**: the dropped
+tensors are reported at `logger.debug` ("Skipping unknown DSpark weight"), invisible at the default
+INFO level, and the broken load "reports success". Full mechanism in
+[`DSPARK-SHARED-EXPERT-FIX.md`](DSPARK-SHARED-EXPERT-FIX.md).
+
+The fix is the one mount line above:
+
+```bash
+-v /var/tmp/spec-dspark.py:/opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py:ro
+```
+
+**Verify it landed** (run against the head *and* worker container):
+
+```bash
+# Expect 6. The patched loader has the two shared-expert mapping rows plus their comment.
+docker exec <container> grep -c shared_experts \
+  /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py     # -> 6
+
+# The stock/unpatched loader carries only the 2 attention rows and returns 0 here.
+# Definitive: boot with VLLM_LOGGING_LEVEL=DEBUG and confirm there are NO
+# "Skipping unknown DSpark weight" lines for shared_experts.w1 / shared_experts.w3:
+docker logs <container> 2>&1 | grep "Skipping unknown DSpark weight.*shared_experts"   # -> (empty)
+```
+
+Or run [`scripts/check-patch4.sh <head-container> <worker-container>`](scripts/check-patch4.sh).
+
+### Verified speed (2× DGX Spark, warmed, single-stream, with Patch 4)
+
+Server-reported `completion_tokens` over wall time, temp 0, **warm** engine (see the warm-up
+caveat below — warm it with a few long generations first):
+
+| workload | with Patch 4 | without Patch 4 |
+| --- | ---: | ---: |
+| count to 100 | **80.1 tok/s** | 50.7 |
+| code | **51.8** | 47.2 |
+| prose | **33.2** | 30.4 |
+
+KV pool **2.79M tokens / 19.12 GiB** at `gpu_memory_utilization=0.85`. (For reference,
+MiaAI-Lab's comparable two-node recipe reports ~2.33M tokens and 62–83 tok/s single-stream.)
+
+**Read these honestly.** The large jump on *count* is Patch 4 (the shared expert now computes
+correctly) **plus** a warm-up effect — this image has a documented cold-start penalty (~58 → 83
+tok/s), so a cold count number understates the warm one. Acceptance on prose-heavy traffic stays
+modest (~25%), which is inherent to this vision variant, so **code and prose gained less than
+count**. Patch 4 is a genuine correctness fix regardless of the exact per-workload attribution: the
+draft's always-on shared expert was loading uninitialised, and now it isn't.
+
+**`k` is 5 on this image — do not use `k=6`.** The DSpark drafter requires
+`num_speculative_tokens` divisible by `n_predict=5`; `k=6` is rejected at boot with
+`must be divisible by n_predict=5`. `k=5` is correct. (Same runtime property documented for the
+text recipe: `k <= 5, or a multiple of 5`.)
 
 ---
 
@@ -299,7 +455,7 @@ Keep these `.env.dspark` values unless you are deliberately experimenting:
 - `MAX_MODEL_LEN=1048576` — **1M, the model's true YaRN ceiling** (see the note above)
 - `MAX_NUM_SEQS=12`
 - `GPU_MEMORY_UTILIZATION=0.85`
-- `MTP_NUM_TOKENS=3` (with `draft_sample_method=probabilistic`; see the [garble fix](#garble-fix-2026-07-03))
+- `MTP_NUM_TOKENS=5` (with `draft_sample_method=probabilistic`; see the [garble fix](#garble-fix-2026-07-03))
 - `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`
 - `VLLM_USE_B12X_WO_PROJECTION=1`
 - `VLLM_USE_FLASHINFER_SAMPLER=1`
@@ -315,55 +471,6 @@ Keep these `.env.dspark` values unless you are deliberately experimenting:
 - `./prepare-dspark-model-cache.sh` downloads the snapshot into `HF_CACHE`,
   verifies every safetensor shard is present, and mirrors the download to the
   worker node.
-
-### Model choice: censored or uncensored
-
-Two checkpoints, one recipe. **Nothing in the launch flow changes between them** — same
-image, same patches, same `k=5`, same `nvfp4_ds_mla` KV cache, same 1M context, same
-`gpu-memory-utilization`. You point `--model` at whichever directory you downloaded.
-
-| | Censored (default) | Uncensored (abliterated) |
-|---|---|---|
-| HF repo | [`deepseek-ai/DeepSeek-V4-Flash-0731`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731) | [`drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32`](https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32) |
-| Author | DeepSeek-AI | **Keys** (`drowzeys`) |
-| Base | — | 0731 GA @ `9e165c30` |
-| Access | open | **gated** — access request + Responsible Use Agreement |
-| Safety refusals | stock | removed (reported 32/32 bypass on a hard refusal suite) |
-| DSpark MTP draft modules | stock | **stock, unedited** |
-| Patch 4 | required | required |
-| Patch 5 | recommended (any stop-sending harness) | recommended |
-| On-disk | ~156 GB | ~156 GB |
-
-**Getting the uncensored weights:**
-
-```bash
-hf download drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32 \
-  --local-dir /var/tmp/models/ds4-0731-abliterated
-```
-
-That download will 403 until you have been granted access. Request it on the model page
-and accept the Responsible Use Agreement first. In short: 18 or older; no sexual
-exploitation or endangerment of minors; no self-harm or suicide-promotion content; no
-harassment, doxxing, or fraud; nothing illegal in your jurisdiction; you are accountable
-for what you prompt it to produce; and the upstream DeepSeek license still applies.
-**Read the terms on the model card itself, not this summary — that page is authoritative.**
-You are the one supplying the guardrails a refusal-trained model would have supplied, so
-plan your filtering, review, and access control before you put it in front of anything.
-
-**What the abliteration actually does.** A single refusal direction is projected out of 33
-`attn.wo_b` tensors across layers 10–42 (λ = 3.5, k = 1, mean relative Frobenius delta
-≈ 0.056). The `float8_e8m0fnu` scales are preserved. **The DSpark MTP draft modules are
-deliberately left untouched**, which is the part that matters for this recipe: the draft
-stages are exactly what [Patch 4](#updating-to-the-official-deepseek-v4-flash-0731-release-2026-07-31)
-repairs and what your acceptance rate rides on. Edited draft weights would land you back in
-that same class of problem.
-
-**What we run.** Our lane 1 serves the abliterated weights on this exact recipe with no
-config changes. We have **not** run a controlled censored-vs-uncensored throughput A/B, so
-read every benchmark number in this README as measured on the stock weights. The edit
-touches 33 attention output projections and leaves the draft stages alone, so there is no
-mechanism we are aware of that would move decode speed — but that is reasoning, not a
-measurement, and we are not going to present it as one.
 
 ### Image / build
 
@@ -1058,7 +1165,7 @@ python3 benchmarks/keys-concurrency/correctness_test.py http://127.0.0.1:8888
 ### 1M single-stream legacy profile
 
 For conservative single-stream testing, set `MAX_NUM_SEQS=1` and
-`VLLM_USE_B12X_WO_PROJECTION=0`. The default `MTP_NUM_TOKENS=3` with
+`VLLM_USE_B12X_WO_PROJECTION=0`. The default `MTP_NUM_TOKENS=5` with
 `draft_sample_method=probabilistic` (2026-07-03 garble fix) applies here too;
 older runs used greedy-draft MTP5, which upstream Mia and Keys had validated but
 which caused the cold-start concurrent garble in agent serving.
@@ -1068,8 +1175,8 @@ which caused the cold-start concurrent garble in agent serving.
 - To combine DSpark concurrency with longer context, pick a lower context target
   first, then raise concurrency slowly while watching boot logs, KV allocation,
   acceptance, and request errors.
-- The current validated agent-serving profile is `MAX_MODEL_LEN=1500000`,
-  `MAX_NUM_SEQS=12`, `GPU_MEMORY_UTILIZATION=0.85`, `MTP_NUM_TOKENS=3` with
+- The current validated agent-serving profile is `MAX_MODEL_LEN=1048576`,
+  `MAX_NUM_SEQS=12`, `GPU_MEMORY_UTILIZATION=0.85`, `MTP_NUM_TOKENS=5` with
   `draft_sample_method=probabilistic`, `VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1`,
   `VLLM_USE_FLASHINFER_SAMPLER=1`, `VLLM_USE_B12X_WO_PROJECTION=1`, no
   `--override-generation-config` (2026-07-03 garble fix), and
@@ -1324,6 +1431,14 @@ recipe.
 
 | path | purpose |
 | --- | --- |
+| [`CURRENT.md`](CURRENT.md) | **start here** — the recipe we actually run today, one section per topology (TP2, TP4) |
+| [`launchers/`](launchers/) | the two runnable launchers: `ds4-vision-tp2.sh <0\|1>` and `ds4-vision-tp4.sh <0\|1\|2\|3>`. One launcher per recipe, canonical path. `vision-exp/ds4-vision-tp2.sh` is a symlink here (older PRs/issues cite it) |
+| [`vision-exp/`](vision-exp/README.md) | the vision port itself — the twelve blockers, `port/*.py`, `build-ds4v-files.sh` (stages the four bind-mounted files on every node) |
+| [`sparkrun/`](sparkrun/README.md) | self-contained sparkrun recipes for the Vision-Exp and text 0731 checkpoints |
+| [`parity/`](parity/) | reproducible serving-fidelity bench and the frozen hosted reference card |
+| `VISION-EXP-DEFAULT-CONFIG.md` | long-form explanation of the TP2 launcher's flags, mounts, benchmarks |
+| `DSPARK-SHARED-EXPERT-FIX.md` | Patch 4 write-up (incl. the vision-port dropped-mount incident) |
+| `scripts/check-patch4.sh` | fail-closed preflight that Patch 4 (`spec-dspark.py`) is mounted on every node |
 | `recipe/overlay/` | base DSpark vLLM overlay files |
 | `recipe/Dockerfile.dspark-runtime-overlay` | builds the base DSpark runtime overlay |
 | `recipe/nvfp4/Dockerfile.stage-a` | adds `nvfp4_ds_mla` dtype plumbing |

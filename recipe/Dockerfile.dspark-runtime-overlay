@@ -32,6 +32,33 @@ COPY vllm/v1/attention/backends/mla/b12x_mla_sparse.py /opt/env/lib/python3.12/s
 COPY vllm/v1/spec_decode/dspark.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py
 COPY vllm/v1/spec_decode/dspark_proposer.py /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py
 COPY vllm/v1/worker/gpu_model_runner.py /opt/env/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py
+# reasoning_effort three-level fix.
+#
+# Verified against THIS fork's base image, ghcr.io/bjk110/vllm-spark:
+# unholy-fusion-prod-ready -- not against upstream vLLM main, whose tokenizer
+# differs. Two facts from that image:
+#
+#   deepseek_v4_encoding.py  carries a single constant REASONING_EFFORT_MAX,
+#                            byte-identical to DeepSeek's *high* text (476 chars).
+#                            There is no three-level table.
+#   deepseek_v4.py:43-52     normalises the request value:
+#                                not a str          -> None
+#                                "none"             -> thinking off
+#                                "max" or "xhigh"   -> "max"
+#                                anything else      -> "high"
+#
+# Because the only constant is upstream's *high* text and it is injected only for
+# "max", the net effect is: "high" injects nothing, "low" does not exist as a
+# distinct level, and DeepSeek's real "max" text (526 chars) is unreachable.
+#
+# These two files restore the three levels using the strings from the checkpoint's
+# own encoding/encoding_dsv4.py, extracted programmatically rather than retyped.
+#
+# BEHAVIOUR CHANGE: after this, reasoning_effort="max" injects DeepSeek's max text
+# instead of its high text. Callers already sending "max" get a materially stronger
+# instruction than before. "low" and omitted stay byte-identical to today.
+COPY vllm/tokenizers/deepseek_v4.py /opt/env/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4.py
+COPY vllm/tokenizers/deepseek_v4_encoding.py /opt/env/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4_encoding.py
 # Streaming tool-parser fix: the stock parser passes an explicit empty
 # `tool_calls=[]` on every content delta once a request carries tools. With
 # exclude_unset=True serialisation that emits `"tool_calls": []`, which is not
@@ -56,6 +83,8 @@ RUN /opt/env/bin/python -m py_compile \
     /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py \
     /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark_proposer.py \
     /opt/env/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py \
+    /opt/env/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4.py \
+    /opt/env/lib/python3.12/site-packages/vllm/tokenizers/deepseek_v4_encoding.py \
     /opt/env/lib/python3.12/site-packages/vllm/tool_parsers/deepseekv32_tool_parser.py
 
 # py_compile only validates syntax. A file that compiles but fails to import --
@@ -73,6 +102,8 @@ CHECKS = [
     ("vllm.v1.executor.multiproc_executor", "WorkerProc"),
     ("vllm.tool_parsers.deepseekv32_tool_parser", "DeepSeekV32ToolParser"),
     ("vllm.tool_parsers.deepseekv4_tool_parser", "DeepSeekV4ToolParser"),
+    ("vllm.tokenizers.deepseek_v4", "DeepseekV4Tokenizer"),
+    ("vllm.tokenizers.deepseek_v4_encoding", "encode_messages"),
 ]
 
 failed = False

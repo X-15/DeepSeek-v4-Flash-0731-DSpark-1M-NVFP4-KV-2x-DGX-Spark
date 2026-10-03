@@ -19,23 +19,6 @@ Keys' patch fixes the two core blockers for `max_num_seqs > 1`:
 
 The validated concurrency numbers in this repo depend directly on that patch.
 
-## Uncensored / Abliterated 0731 Weights
-
-Keys / drowzeys also publishes the abliterated build of official 0731 that this recipe
-runs as its uncensored option:
-
-- Model: https://huggingface.co/drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32
-- Base: `deepseek-ai/DeepSeek-V4-Flash-0731` @ `9e165c30`
-- Method: single refusal direction projected out of 33 `attn.wo_b` tensors, layers 10–42,
-  λ = 3.5, `float8_e8m0fnu` scales preserved, **DSpark MTP draft modules left unedited**.
-
-Access is gated on Hugging Face behind a Responsible Use Agreement, and the upstream
-DeepSeek license still governs the weights. The model card is the authoritative statement
-of those terms. Keys credits Anemll (`Anemll/dspark-vllm-gx10`), MiaAI-Lab, and DeepSeek-AI
-for the runtime and base model it is built on.
-
-See [Model choice: censored or uncensored](README.md#model-choice-censored-or-uncensored).
-
 ## DSpark Cold-Start Garble Root-Cause Fix (Patch 3)
 
 The scheduler-level root cause of the cold-resume garble (prompt echo / leaked

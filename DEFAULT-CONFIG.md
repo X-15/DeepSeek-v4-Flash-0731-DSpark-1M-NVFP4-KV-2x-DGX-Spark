@@ -23,12 +23,6 @@
 >    `DeepSeek-V4-Flash-0731`; substitute your 0731 weights path. Everything else in the ⭐ block
 >    still matches what is served today except that the live server also passes
 >    `--reasoning-config` and `--enable-flashinfer-autotune`.
-> 5. **Censored or uncensored is just the `--model` path.** Every flag on this page is
->    identical for the stock `deepseek-ai/DeepSeek-V4-Flash-0731` weights and for Keys'
->    abliterated build (`drowzeys/keys-DeepSeekV4-Flash-GA-0731-Dspark-Abliterated-32-32`,
->    gated, Responsible Use terms apply). Same image, same patches, same `k=5`, same
->    `nvfp4_ds_mla`, same context. See
->    [Model choice: censored or uncensored](README.md#model-choice-censored-or-uncensored).
 >
 > Throughput and acceptance figures on this page were measured on the **preview** checkpoint with the
 > **stock (buggy) loader**, and on the **stock (censored)** weights — there is no
@@ -112,6 +106,17 @@ Measured on this hardware and rejected — each was neutral or worse:
   As-deployed on probe-c-p2b (which predates Patch 3) it was injected via bind-mount:
   `-v /var/tmp/patch3-scheduler.py:/opt/env/lib/python3.12/site-packages/vllm/v1/core/sched/scheduler.py:ro`
   (source = repo `recipe/overlay/vllm/v1/core/sched/scheduler.py`).
+- **Patch 4 (DSpark draft shared-expert loader fix — REQUIRED on probe-c images):** in a fresh
+  stage-c build it's baked in. On the pre-patch probe-c-p2b image it must be injected via bind-mount
+  **right after the Patch 3 mount** — omitting it loads the draft's always-on shared expert
+  uninitialised and runs at ~half speed, silently (see [`DSPARK-SHARED-EXPERT-FIX.md`](DSPARK-SHARED-EXPERT-FIX.md)):
+  `-v /var/tmp/spec-dspark.py:/opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py:ro`
+  (source = repo `recipe/overlay/vllm/v1/spec_decode/dspark.py`). Verify with
+  `docker exec <container> grep -c shared_experts /opt/env/lib/python3.12/site-packages/vllm/v1/spec_decode/dspark.py`
+  → expect **6** (stock loader returns 0), or run [`scripts/check-patch4.sh`](scripts/check-patch4.sh).
+  The current **vision** deployment (`DeepSeek-V4-Flash-Vision-Exp`) runs this exact probe-c image
+  with both bind-mounts **plus** the `ds4v_*.py` vision-model mounts — see
+  [`VISION-EXP-DEFAULT-CONFIG.md`](VISION-EXP-DEFAULT-CONFIG.md).
 
 ## Exact vLLM command (byte-for-byte, as running)
 ```
@@ -160,8 +165,27 @@ TORCH_CUDA_ARCH_LIST=12.1a  FLASHINFER_CUDA_ARCH_LIST=12.1a  FLASHINFER_DISABLE_
 TILELANG_CLEANUP_TEMP_FILES=1  DG_JIT_USE_NVRTC=0  DG_JIT_NVCC_COMPILER=/opt/env/bin/nvcc
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NCCL_NET=IB  NCCL_IB_DISABLE=0  NCCL_IB_HCA=rocep1s0f0  NCCL_SOCKET_IFNAME=enp1s0f0np0
-NCCL_IB_GID_INDEX=3  NCCL_CROSS_NIC=1  NCCL_CUMEM_ENABLE=0  NCCL_IGNORE_CPU_AFFINITY=1
+NCCL_CROSS_NIC=1  NCCL_CUMEM_ENABLE=0  NCCL_IGNORE_CPU_AFFINITY=1  # NCCL_IB_GID_INDEX: unset on purpose — see dual-HCA note
 NCCL_DEBUG=WARN  NCCL_NVLS_ENABLE=0
+```
+
+> **Dual-HCA note (direct QSFP pairs):** the GB10 QSFP port is TWO virtual NICs
+> (2x PCIe x4). With only one configured, NCCL runs at ~half the port: measured
+> 98 Gb/s single vs **161 Gb/s** with both HCAs listed and `NCCL_IB_MERGE_NICS=1`
+> (+64% busbw, nccl-tests). Both interfaces need an IP (separate subnets, persisted via a
+> netplan drop-in on DGX OS — `nmcli` profiles live in /run and evaporate on
+> reboot) and MTU 9000 on BOTH ends (a firmware capsule reboot has been seen
+> resetting one side to 1500 → `IBV_WC_RETRY_EXC_ERR(12)` on large transfers);
+> map names with `ibdev2netdev`. **Leave `NCCL_IB_GID_INDEX` unset** — GID
+> table indexes drift when interface events reshuffle the table (3→4 within
+> 30 min observed), and a pinned index hangs the TP handshake silently on one
+> HCA; modern NCCL picks the RoCEv2/IPv4 GID per device (issue #38 field
+> report, credit @Lollorosso2 — also measured +8% single-stream / 135 tok/s
+> @c6 with the merge on a second GB10 rig). First boot after ANY NCCL topology
+> change re-runs JIT tuning (~36 min observed) — a watchdog that gives up at
+> 20 min will "confirm" a hang that isn't one.
+
+```
 HF_HUB_OFFLINE=1  TRANSFORMERS_OFFLINE=1  HF_HUB_DISABLE_XET=1  HF_HOME=/cache/huggingface  VLLM_CACHE_ROOT=/cache/huggingface/vllm-cache
 ```
 
